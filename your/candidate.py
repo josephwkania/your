@@ -331,6 +331,50 @@ class Candidate(Your):
             self.dedispersed = None
         return self
 
+    def _delay_bins(self, dms):
+        """Per-channel delay in samples, relative to `chan_freqs[0]`."""
+        delay_time = (
+            4148808.0
+            * dms
+            * (1 / (self.chan_freqs[0]) ** 2 - 1 / (self.chan_freqs) ** 2)
+            / 1000
+        )
+        return np.round(delay_time / self.native_tsamp).astype("int64")
+
+    def _band_cumsum(self):
+        """
+        Cumulative sum of `self.data` along the channel axis, with a leading
+        zero row, so any contiguous span of channels sums as one subtraction.
+        It does not depend on DM, so `dmtime` builds it once and reuses it for
+        every DM step.
+
+        Stored channel-major, `(nchans + 1, nt)`, so each span is one
+        contiguous row. Row-major costs about 1.5x at DM 50: a span read down
+        a column touches a fresh cache line per sample.
+
+        Only built for integer data, where the subtraction is exact. Float data
+        would lose bits to cancellation, so `dedispersets` keeps the per-channel
+        loop for it.
+        """
+        if not np.issubdtype(self.data.dtype, np.integer):
+            return None
+        if getattr(self, "_cumsum_src", None) is self.data:
+            return self._cumsum
+        nt, nf = self.data.shape
+        # Narrowest type the whole band still sums into exactly: int32 for
+        # 8-bit data, which is every real filterbank here. Going narrower than
+        # the accumulator does not pay -- uint16 holds each span by wrapping,
+        # and is exact, but the widening on every add costs more than the
+        # halved footprint saves.
+        info = np.iinfo(self.data.dtype)
+        bound = nf * max(abs(int(info.min)), int(info.max))
+        acc = np.int32 if bound <= np.iinfo(np.int32).max else np.int64
+        out = np.zeros((nf + 1, nt), dtype=acc)
+        np.cumsum(self.data.T, axis=0, dtype=acc, out=out[1:])
+        self._cumsum_src = self.data
+        self._cumsum = out
+        return out
+
     def dedispersets(self, dms=None):
         """
         Create a dedispersed time series
@@ -347,22 +391,41 @@ class Candidate(Your):
         """
         if dms is None:
             dms = self.dm
-        if self.data is not None:
-            nt, nf = self.data.shape
-            assert nf == len(self.chan_freqs)
-            delay_time = (
-                4148808.0
-                * dms
-                * (1 / (self.chan_freqs[0]) ** 2 - 1 / (self.chan_freqs) ** 2)
-                / 1000
-            )
-            delay_bins = np.round(delay_time / self.native_tsamp).astype("int64")
+        if self.data is None:
+            return None
+
+        nt, nf = self.data.shape
+        assert nf == len(self.chan_freqs)
+        delay_bins = self._delay_bins(dms)
+
+        cumsum = self._band_cumsum()
+        if cumsum is None:
             ts = np.zeros(nt, dtype=np.float32)
             for ii in range(nf):
                 ts += np.concatenate(
                     [self.data[-delay_bins[ii] :, ii], self.data[: -delay_bins[ii], ii]]
                 )
             return ts
+
+        # Delay grows monotonically with channel, so channels sharing a delay
+        # bin are contiguous: sum each run with one subtraction of the cumsum
+        # instead of touching all nf channels. Runs of equal value are found
+        # directly, so a non-monotonic band is still correct, just slower.
+        edges = np.flatnonzero(np.diff(delay_bins)) + 1
+        starts = np.concatenate(([0], edges))
+        stops = np.concatenate((edges, [nf]))
+
+        acc = np.zeros(nt, dtype=cumsum.dtype)
+        for start, stop in zip(starts, stops):
+            run = cumsum[stop] - cumsum[start]
+            shift = int(delay_bins[start]) % nt
+            # roll by `shift` without allocating a rolled copy
+            if shift:
+                acc[:shift] += run[nt - shift :]
+                acc[shift:] += run[: nt - shift]
+            else:
+                acc += run
+        return acc.astype(np.float32)
 
     def dmtime(self, dmsteps=256, target="CPU"):
         """

@@ -233,3 +233,75 @@ def test_kill_mask():
     assert cand.data[:, cand.kill_mask].sum() == 0
     assert cand.data[:, [10, 12, 300]].sum() == 0
     assert cand.data[:, ~cand.kill_mask].sum() != 0
+
+
+def _dedispersets_upstream(data, chan_freqs, tsamp, dms):
+    """The per-channel roll-and-add the cumsum path replaces."""
+    nt, nf = data.shape
+    delay_time = (
+        4148808.0 * dms * (1 / (chan_freqs[0]) ** 2 - 1 / (chan_freqs) ** 2) / 1000
+    )
+    delay_bins = np.round(delay_time / tsamp).astype("int64")
+    ts = np.zeros(nt, dtype=np.float32)
+    for ii in range(nf):
+        ts += np.concatenate([data[-delay_bins[ii] :, ii], data[: -delay_bins[ii], ii]])
+    return ts
+
+
+@pytest.mark.parametrize("cand", ["cand_fil", "cand_fits"])
+def test_dedispersets_matches_upstream(cand, request):
+    """The cumsum path is exact on integer data, not merely close."""
+    cand = request.getfixturevalue(cand)
+    cand.get_chunk()
+    for dms in (0.0, cand.dm / 2, cand.dm, 2 * cand.dm):
+        got = cand.dedispersets(dms=dms)
+        want = _dedispersets_upstream(
+            cand.data, cand.chan_freqs, cand.native_tsamp, dms
+        )
+        assert np.array_equal(got, want)
+
+
+def test_dedispersets_float_data_falls_back(cand_fil):
+    """Float data keeps the per-channel loop, where cancellation is not a risk."""
+    cand_fil.get_chunk()
+    cand_fil.data = cand_fil.data.astype(np.float32)
+    assert cand_fil._band_cumsum() is None
+    got = cand_fil.dedispersets()
+    want = _dedispersets_upstream(
+        cand_fil.data, cand_fil.chan_freqs, cand_fil.native_tsamp, cand_fil.dm
+    )
+    assert np.allclose(got, want)
+
+
+def test_band_cumsum_rebuilds_for_new_data(cand_fil):
+    """The cached cumsum must not outlive the chunk it was built from."""
+    cand_fil.get_chunk()
+    first = cand_fil._band_cumsum()
+    cand_fil.data = cand_fil.data[:, ::-1].copy()
+    assert cand_fil._band_cumsum() is not first
+
+
+def test_dedispersets_without_chunk_returns_none(cand_fil):
+    """`get_chunk` has not run, so there is nothing to dedisperse."""
+    assert cand_fil.data is None
+    assert cand_fil.dedispersets() is None
+
+
+def test_band_cumsum_widens_when_int32_would_overflow(cand_fil):
+    """The accumulator is picked from the band's worst case, not hardcoded."""
+    rng = np.random.default_rng(0)
+
+    cand_fil.data = rng.integers(0, 256, size=(8, 16), dtype=np.uint8)
+    assert cand_fil._band_cumsum().dtype == np.int32
+
+    # int32 input cannot be summed exactly in int32 beyond one channel
+    nf = len(cand_fil.chan_freqs)
+    cand_fil.data = rng.integers(0, 1000, size=(64, nf), dtype=np.int32)
+    assert cand_fil._band_cumsum().dtype == np.int64
+
+    # and the widened path still agrees with the per-channel loop
+    got = cand_fil.dedispersets(dms=10.0)
+    want = _dedispersets_upstream(
+        cand_fil.data, cand_fil.chan_freqs, cand_fil.native_tsamp, 10.0
+    )
+    assert np.array_equal(got, want)
