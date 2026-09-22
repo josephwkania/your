@@ -84,3 +84,50 @@ def test_gpu_dedisp_dmt_crop():
 
     assert np.isclose(np.sum(g_dmt - c_dmt), 0, atol=1)
     assert np.isclose(np.sum(g_dedisp - c_dedisp), 0, atol=1)
+
+
+def _dmt_cand(dm):
+    file = os.path.join(_install_dir, "data/28.fil")
+    cand = Candidate(
+        fp=file,
+        dm=dm,
+        tcand=2.0288800,
+        width=2,
+        label=-1,
+        snr=16.8128,
+        min_samp=256,
+        device=0,
+    )
+    cand.get_chunk()
+    return cand
+
+
+# dm 10 collapses the band to 0.03 spans per channel, dm 475 to 0.82, so the
+# two sit either side of the default crossover and take a kernel each
+@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("dm", [10, 475.284])
+def test_gpu_dmt_kernels_agree(dm):
+    """Which kernel runs is a speed choice, so it must not change the plane."""
+    runs = gpu_dmt(_dmt_cand(dm), max_run_fraction=1.0).dmt
+    channels = gpu_dmt(_dmt_cand(dm), max_run_fraction=0.0).dmt
+    assert np.array_equal(runs, channels)
+
+
+@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("dm", [10, 475.284])
+def test_gpu_dmt_matches_cpu(dm):
+    cand = _dmt_cand(dm)
+    cand.dmtime(target="CPU")
+    cpu = cand.dmt.copy()
+    assert np.array_equal(gpu_dmt(_dmt_cand(dm)).dmt, cpu)
+
+
+@pytest.mark.skipif(not cuda.is_available(), reason="requires a GPU")
+def test_gpu_dmt_picks_each_kernel():
+    for dm, expected in ((10, True), (475.284, False)):
+        cand = _dmt_cand(dm)
+        freqs = np.asarray(cand.chan_freqs, dtype=np.float64)
+        dms = cand.dm + np.linspace(-cand.dm, cand.dm, 256)
+        _, nruns = run_edges(delay_table(freqs, float(cand.your_header.tsamp), dms))
+        fraction = nruns.mean() / len(freqs)
+        assert bool(fraction <= 0.6) is expected
